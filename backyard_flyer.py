@@ -9,8 +9,12 @@ from udacidrone.connection import MavlinkConnection, WebSocketConnection  # noqa
 from udacidrone.messaging import MsgID
 
 
-TARGET_HEIGHT = 3.0  # [m]
-BOX_SIZE = 10.0      # [m]
+TARGET_HEIGHT = 3.0     # [m]
+BOX_SIZE = 10.0         # [m]
+
+TOLERANCE_XY = 0.5     # [m]
+TOLERANCE_Z = 0.1    # [m]
+TOLERANCE_VEL = 0.25     # [m/s]
 
 
 class States(Enum):
@@ -30,12 +34,12 @@ class BackyardFlyer(Drone):
         self.all_waypoints = self.calculate_box()
         self.in_mission = True
         self.check_state = {}
-        self.is_moving = False
+        self.is_stable = False
 
-        # initial state
+        # Initial state
         self.flight_state = States.MANUAL
 
-        # TODO: Register all your callbacks here
+        # Callbacks
         self.register_callback(MsgID.LOCAL_POSITION, self.local_position_callback)
         self.register_callback(MsgID.LOCAL_VELOCITY, self.velocity_callback)
         self.register_callback(MsgID.STATE, self.state_callback)
@@ -44,29 +48,26 @@ class BackyardFlyer(Drone):
         """
         This triggers when `MsgID.LOCAL_POSITION` is received and self.local_position contains new data
         """
-        if self.flight_state == States.LANDING and abs(self.local_position[2]) < 0.1:
-            self.disarming_transition()
-
-        elif points_close_enough(self.local_position, self.target_position) and \
-           not self.is_moving:
-            if self.flight_state == States.TAKEOFF:
+        if self.flight_state == States.TAKEOFF:
+            if self._arrived_to_point(self.target_position):
                 self.waypoint_transition()
-            elif self.flight_state == States.WAYPOINT:
-                if points_close_enough(self.target_position, self.all_waypoints[-1]):
+
+        elif self.flight_state == States.WAYPOINT:
+            if self._arrived_to_point(self.target_position):
+                if self.target_position == self.all_waypoints[-1]:
                     self.landing_transition()
                 else:
                     self.waypoint_transition()
-        else:
-            print('{}, {}'.format(self.local_position, self.target_position))
+
+        elif self.flight_state == States.LANDING:
+            if self._on_ground():
+                self.disarming_transition()
 
     def velocity_callback(self):
         """
         This triggers when `MsgID.LOCAL_VELOCITY` is received and self.local_velocity contains new data
         """
-        if points_close_enough(self.local_velocity, [0.0, 0.0, 0.0]):
-            self.is_moving = False
-        else:
-            self.is_moving = True
+        self.is_stable = vector_equal(self.local_velocity, [0.0, 0.0, 0.0], TOLERANCE_VEL)
 
     def state_callback(self):
         """
@@ -77,8 +78,9 @@ class BackyardFlyer(Drone):
                 self.arming_transition()
             elif self.flight_state == States.DISARMING:
                 self.manual_transition()
-        elif self.armed and self.guided and self.flight_state == States.ARMING:
-            self.takeoff_transition()
+        else:
+            if self.flight_state == States.ARMING:
+                self.takeoff_transition()
 
     def calculate_box(self):
         """
@@ -86,10 +88,10 @@ class BackyardFlyer(Drone):
         """
         waypoints = \
         [
-            [BOX_SIZE, 0.0,      -TARGET_HEIGHT],
-            [BOX_SIZE, BOX_SIZE, -TARGET_HEIGHT],
-            [0.0,      BOX_SIZE, -TARGET_HEIGHT],
-            [0.0,      0.0,      -TARGET_HEIGHT]
+            [BOX_SIZE, 0.0,      TARGET_HEIGHT],
+            [BOX_SIZE, BOX_SIZE, TARGET_HEIGHT],
+            [0.0,      BOX_SIZE, TARGET_HEIGHT],
+            [0.0,      0.0,      TARGET_HEIGHT]
         ]
 
         return waypoints
@@ -116,7 +118,7 @@ class BackyardFlyer(Drone):
         """
         print("takeoff transition")
 
-        self.target_position = [0.0, 0.0, -TARGET_HEIGHT]
+        self.target_position = [0.0, 0.0, TARGET_HEIGHT]
         self.takeoff(TARGET_HEIGHT)
         self.flight_state = States.TAKEOFF
 
@@ -125,12 +127,14 @@ class BackyardFlyer(Drone):
         1. Command the next waypoint position
         2. Transition to WAYPOINT state
         """
-        print("waypoint transition")
-
         current_target_idx = self.all_waypoints.index(self.target_position)
-        self.target_position = self.all_waypoints[(current_target_idx + 1) % len(self.all_waypoints)]
-        self.cmd_position(*self.target_position[0:2], -self.target_position[2], 0.0)
+        next_target_idx = (current_target_idx + 1) % len(self.all_waypoints)
+        self.target_position = self.all_waypoints[next_target_idx]
+
+        self.cmd_position(*self.target_position, 0.0)
         self.flight_state = States.WAYPOINT
+
+        print("waypoint transition to {}".format(self.target_position))
 
     def landing_transition(self):
         """
@@ -181,8 +185,36 @@ class BackyardFlyer(Drone):
         print("Closing log file")
         self.stop_log()
 
-def points_close_enough(p1, p2):
-    return np.linalg.norm(np.array(p1) - np.array(p2)) < 0.5
+    def _arrived_to_point(self, point):
+        return vector_equal(ned_to_nea(self.local_position), point, TOLERANCE_XY) and self.is_stable
+
+    def _on_ground(self):
+        return vector_equal(self.local_position[2], 0.0, TOLERANCE_Z)
+
+def vector_equal(p1, p2, tolerance):
+    """Determine if 2 vectors are close enough, given some tolerance.
+
+    Args:
+        p1 (list): first vector
+        p2 (list): second vector
+        tolerance (float): tolerance to compare the norm of the difference
+
+    Returns:
+        bool: True if the norm is smaller than the tolerance; False otherwise
+
+    """
+    return np.linalg.norm(np.array(p1) - np.array(p2)) < tolerance
+
+def ned_to_nea(x):
+    """Convert from North-East-Down to North-East-Altitude.
+
+    Args:
+        x (list): input position vector in North-East-Down format
+
+    Returns:
+        list: output position vector in North-East-Altitude format
+    """
+    return [x[0], x[1], -x[2]]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
